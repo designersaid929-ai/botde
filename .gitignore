@@ -1,0 +1,41 @@
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environment & Sessions
+.env
+session-*
+*.session
+*.db
+isl0m._/
+test_dl/
+
+# Temporary downloads
+temp_downloads/
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.webp
+*.json.xz
+
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE & OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
