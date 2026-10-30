@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
+from itertools import islice
 from typing import Optional, List, Tuple
 
 import instaloader
@@ -265,6 +266,69 @@ class InstagramService:
         """Returns (is_logged_in, username)."""
         return self.is_logged_in, self.logged_in_username
 
+    def _drop_session(self) -> None:
+        """Discards a session that Instagram rejected so requests fall back to anonymous mode."""
+        logger.warning(
+            "Instagram rejected the session cookie (expired or logged out). "
+            "Falling back to anonymous mode. Update it via /setsession or INSTAGRAM_SESSION_ID."
+        )
+        self.loader.context._session = self.loader.context.get_anonymous_session()
+        self.loader.context.username = None
+        self.loader.context.user_id = None
+        self.logged_in_username = None
+
+    @staticmethod
+    def _is_session_rejected(err: Exception) -> bool:
+        """True if Instagram answered with 'login required' (dead/expired session), not a real 429."""
+        if isinstance(err, LoginRequiredException):
+            return True
+        msg = str(err).lower()
+        return any(s in msg for s in ("401 unauthorized", "require_login", "redirected to login", "logged out"))
+
+    @staticmethod
+    def _translate_error(err: Exception, what: str) -> InstagramServiceException:
+        """Maps low-level Instaloader errors to the bot's domain exceptions by their real cause."""
+        msg = str(err).lower()
+        if isinstance(err, TooManyRequestsException) or "429" in msg or "too many requests" in msg:
+            return RateLimitError(
+                "Instagram has temporarily rate-limited requests (HTTP 429). "
+                "Please wait a few minutes or add an Instagram session (/session)."
+            )
+        if InstagramService._is_session_rejected(err):
+            return SessionRequiredError(
+                "Instagram rejected the request and requires login. "
+                "Your Instagram session is missing or expired — update it with /setsession."
+            )
+        if any(s in msg for s in ("checkpoint_required", "challenge_required", "feedback_required")):
+            return SessionRequiredError(
+                "Instagram requires a security check for this account. "
+                "Log in on instagram.com, pass the check, then update the cookie with /setsession."
+            )
+        if "403" in msg:
+            return InstagramServiceException(f"Instagram denied access (HTTP 403) while {what}.")
+        return InstagramServiceException(f"Instagram error while {what}: {err}")
+
+    def _load_profile(self, clean_user: str) -> instaloader.Profile:
+        """Fetches a profile with its full metadata (Instaloader loads it lazily otherwise)."""
+        def load():
+            profile = instaloader.Profile.from_username(self.loader.context, clean_user)
+            profile._obtain_metadata()
+            return profile
+        return self._with_session_fallback(load)
+
+    def _with_session_fallback(self, func, *args):
+        """
+        Runs an Instaloader call. If Instagram rejects the stored session cookie,
+        drops it and retries once anonymously (public data works without login).
+        """
+        try:
+            return func(*args)
+        except (AbortDownloadException, ConnectionException, LoginRequiredException) as err:
+            if self.is_logged_in and self._is_session_rejected(err):
+                self._drop_session()
+                return func(*args)
+            raise
+
     # =========================================================================
     # Public Async API Methods
     # =========================================================================
@@ -304,7 +368,7 @@ class InstagramService:
         """Synchronously queries Instagram profile metadata."""
         clean_user = username.lower().strip("@ ")
         try:
-            profile = instaloader.Profile.from_username(self.loader.context, clean_user)
+            profile = self._load_profile(clean_user)
             return InstagramProfileResult(
                 username=profile.username,
                 full_name=profile.full_name or profile.username,
@@ -320,19 +384,12 @@ class InstagramService:
             )
         except ProfileNotExistsException:
             raise ProfileNotFoundError(f"Instagram profile @{clean_user} does not exist.")
-        except (TooManyRequestsException, AbortDownloadException):
-            raise RateLimitError("Instagram has temporarily rate-limited requests (HTTP 429). Please wait a few minutes or add an Instagram session (/session).")
-        except ConnectionException as ce:
-            msg = str(ce).lower()
-            if "429" in msg or "too many requests" in msg:
-                raise RateLimitError("Instagram rate limit reached (HTTP 429). Please wait a few minutes or add an Instagram session (/session).")
-            if "401" in msg or "login required" in msg:
-                raise SessionRequiredError("Instagram requires authentication to view this profile.")
-            raise InstagramServiceException(f"Network error querying Instagram: {ce}")
         except QueryReturnedNotFoundException:
             raise ProfileNotFoundError(f"Instagram profile @{clean_user} was not found.")
         except QueryReturnedBadRequestException:
             raise InstagramServiceException("Instagram returned bad request. Please check username spelling.")
+        except (AbortDownloadException, ConnectionException, LoginRequiredException) as err:
+            raise self._translate_error(err, f"checking @{clean_user}")
         except Exception as e:
             logger.exception(f"Unexpected error checking profile {clean_user}: {e}")
             raise InstagramServiceException(f"Failed to check profile @{clean_user}: {e}")
@@ -341,11 +398,11 @@ class InstagramService:
         """Synchronously downloads recent posts for a public profile (or private if followed)."""
         clean_user = username.lower().strip("@ ")
         try:
-            profile = instaloader.Profile.from_username(self.loader.context, clean_user)
+            profile = self._load_profile(clean_user)
         except ProfileNotExistsException:
             raise ProfileNotFoundError(f"Instagram profile @{clean_user} does not exist.")
-        except (TooManyRequestsException, AbortDownloadException):
-            raise RateLimitError("Instagram rate limit reached (HTTP 429).")
+        except (AbortDownloadException, ConnectionException, LoginRequiredException) as err:
+            raise self._translate_error(err, f"accessing @{clean_user}")
         except Exception as e:
             raise InstagramServiceException(f"Error accessing @{clean_user}: {e}")
 
@@ -358,12 +415,14 @@ class InstagramService:
             return []
 
         downloaded_posts: List[DownloadedPost] = []
-        posts_iterator = profile.get_posts()
+        try:
+            posts = list(islice(profile.get_posts(), count))
+        except PrivateProfileNotFollowedException:
+            raise PrivateProfileError(f"Account @{clean_user} is private and your session does not follow them.")
+        except (AbortDownloadException, ConnectionException, LoginRequiredException) as err:
+            raise self._translate_error(err, f"listing posts of @{clean_user}")
 
-        for idx, post in enumerate(posts_iterator):
-            if idx >= count:
-                break
-
+        for idx, post in enumerate(posts):
             post_folder = target_dir / f"post_{post.shortcode}"
             post_folder.mkdir(parents=True, exist_ok=True)
 
@@ -406,11 +465,13 @@ class InstagramService:
     def _sync_get_post_by_shortcode(self, shortcode: str, target_dir: Path) -> DownloadedPost:
         """Synchronously downloads a single post/reel by shortcode."""
         try:
-            post = instaloader.Post.from_shortcode(self.loader.context, shortcode)
-        except ProfileNotExistsException:
+            post = self._with_session_fallback(
+                lambda: instaloader.Post.from_shortcode(self.loader.context, shortcode)
+            )
+        except (ProfileNotExistsException, QueryReturnedNotFoundException):
             raise MediaNotFoundError("The requested post was not found or is private.")
-        except LoginRequiredException:
-            raise SessionRequiredError("Instagram requires login to access this post.")
+        except (AbortDownloadException, ConnectionException, LoginRequiredException) as err:
+            raise self._translate_error(err, f"fetching post {shortcode}")
         except Exception as e:
             raise InstagramServiceException(f"Error fetching post {shortcode}: {e}")
 
@@ -454,8 +515,12 @@ class InstagramService:
 
         try:
             profile = instaloader.Profile.from_username(self.loader.context, clean_user)
+            profile._obtain_metadata()
         except ProfileNotExistsException:
             raise ProfileNotFoundError(f"Instagram profile @{clean_user} does not exist.")
+        except (AbortDownloadException, ConnectionException, LoginRequiredException) as err:
+            # Stories need a valid login, so a rejected session can't fall back to anonymous here
+            raise self._translate_error(err, f"accessing @{clean_user}")
         except Exception as e:
             raise InstagramServiceException(f"Error accessing @{clean_user}: {e}")
 
@@ -465,10 +530,8 @@ class InstagramService:
 
         try:
             stories_iter = self.loader.get_stories(userids=[profile.userid])
-        except LoginRequiredException:
-            raise SessionRequiredError("Your Instagram session has expired or is invalid. Please update cookies.")
-        except TooManyRequestsException:
-            raise RateLimitError("Instagram rate limit reached when requesting stories.")
+        except (AbortDownloadException, ConnectionException, LoginRequiredException) as err:
+            raise self._translate_error(err, f"requesting stories for @{clean_user}")
         except Exception as e:
             raise InstagramServiceException(f"Error fetching stories for @{clean_user}: {e}")
 

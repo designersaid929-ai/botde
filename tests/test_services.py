@@ -77,6 +77,33 @@ async def test_check_profile_rate_limited(service):
             await service.check_profile("some_user")
 
 
+UNAUTHORIZED = instaloader.exceptions.AbortDownloadException(
+    'Query to https://www.instagram.com/graphql/query responded with "401 Unauthorized": '
+    '{"message":"Please wait a few minutes before you try again.","require_login":true}'
+)
+
+
+@pytest.mark.asyncio
+async def test_check_profile_401_is_not_reported_as_rate_limit(service):
+    # Anonymous 401 "require_login" must not be shown as HTTP 429
+    with patch("instaloader.Profile.from_username", side_effect=UNAUTHORIZED):
+        with pytest.raises(SessionRequiredError):
+            await service.check_profile("some_user")
+
+
+@pytest.mark.asyncio
+async def test_check_profile_drops_rejected_session_and_retries(service):
+    service.set_session_cookie(session_id="dead_cookie", username="old_account")
+    mock_profile = MagicMock(username="nasa", is_private=False, mediacount=1, followers=1, followees=1)
+
+    with patch("instaloader.Profile.from_username", side_effect=[UNAUTHORIZED, mock_profile]) as m:
+        result = await service.check_profile("nasa")
+
+    assert result.username == "nasa"
+    assert m.call_count == 2
+    assert service.is_logged_in is False
+
+
 @pytest.mark.asyncio
 async def test_get_recent_posts_private_profile_raises(service, tmp_path):
     mock_profile = MagicMock()
