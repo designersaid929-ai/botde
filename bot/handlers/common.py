@@ -10,6 +10,12 @@ logger = logging.getLogger(__name__)
 router = Router(name="common_router")
 
 
+def _is_admin(message: Message) -> bool:
+    """True only for the configured bot admin."""
+    from bot.config import config
+    return bool(config.ADMIN_ID and message.from_user and message.from_user.id == config.ADMIN_ID)
+
+
 @router.message(CommandStart())
 async def handle_start(message: Message):
     """Handles /start command with an engaging welcome message and usage instructions."""
@@ -147,6 +153,10 @@ async def handle_setadmin(message: Message):
     if not user_id:
         return
 
+    # Only the first claim (no admin yet) or the current admin may set the admin
+    if config.ADMIN_ID and not _is_admin(message):
+        return
+
     try:
         import re
         env_path = config.BASE_DIR / ".env"
@@ -262,18 +272,36 @@ async def handle_session(message: Message):
 
 @router.message(Command("setsession"))
 async def handle_set_session(message: Message):
-    """Allows setting sessionid cookie dynamically."""
-    parts = message.text.strip().split(maxsplit=1)
+    """Allows the admin to set Instagram cookies dynamically."""
+    from bot.config import config
+
+    if not _is_admin(message):
+        await message.answer("⛔ Bu buyruq faqat bot admini uchun.", parse_mode="HTML")
+        return
+
+    parts = message.text.strip().split()
     if len(parts) < 2:
         await message.answer(
-            "ℹ️ <b>Foydalanish:</b> <code>/setsession &lt;sessionid_cookie&gt;</code>\n\n"
-            "Brauzerdan <code>sessionid</code> qiymatini nusxalab, ushbu buyruq bilan yuboring.",
+            "ℹ️ <b>Foydalanish:</b> <code>/setsession &lt;sessionid&gt; [csrftoken]</code>\n\n"
+            "Brauzerdan <code>sessionid</code> (va ixtiyoriy <code>csrftoken</code>) qiymatini nusxalab, "
+            "ushbu buyruq bilan yuboring.",
             parse_mode="HTML"
         )
         return
 
+    # The message holds a login cookie, so don't leave it in the chat history
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
     session_id = parts[1].strip()
-    success = instagram_service.set_session_cookie(session_id=session_id)
+    csrf_token = parts[2].strip() if len(parts) > 2 else None
+    # sessionid starts with the account's numeric id ("<ds_user_id>%3A...")
+    ds_user_id = session_id.split("%3A", 1)[0] if "%3A" in session_id else None
+    success = instagram_service.set_session_cookie(
+        session_id=session_id, csrf_token=csrf_token, ds_user_id=ds_user_id
+    )
 
     if success:
         try:
@@ -290,8 +318,10 @@ async def handle_set_session(message: Message):
             logger.warning(f"Could not persist session to .env: {e}")
 
         await message.answer(
-            "✅ <b>Instagram sessiyasi muvaffaqiyatli ulandi!</b>\n\n"
-            "Instagram cheklovlari (429 Rate limit) olib tashlandi. Endi bemalol profillarni tekshirishingiz va postlarni yuklab olishingiz mumkin.",
+            "✅ <b>Instagram sessiyasi ulandi!</b>\n\n"
+            "Xavfsizlik uchun xabaringiz o'chirildi. Endi profilni tekshirib ko'ring.\n"
+            "<i>Eslatma: server qayta ishga tushsa, bu sessiya yo'qoladi — doimiy saqlash uchun "
+            "uni hostingdagi INSTAGRAM_SESSION_ID o'zgaruvchisiga ham yozing.</i>",
             parse_mode="HTML"
         )
     else:
